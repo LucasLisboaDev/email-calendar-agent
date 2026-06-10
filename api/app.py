@@ -56,9 +56,6 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # In-memory run history — stores results of recent /run calls
 _run_history: list[dict] = []
