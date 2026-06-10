@@ -2,12 +2,18 @@
 auth/gmail_auth.py
 
 Handles Gmail OAuth 2.0 authentication.
-- First run: opens a browser window for the user to log in and grant permissions.
-- Subsequent runs: loads the saved token and refreshes it automatically if expired.
-- Returns an authenticated Gmail API service object ready to use.
+
+Works in two modes:
+  LOCAL:   Reads credentials.json and token.json from disk (dev)
+  RAILWAY: Reads GOOGLE_CREDENTIALS_JSON and GOOGLE_TOKEN_JSON
+           env vars (production — no files on server)
+
+The mode is detected automatically — no config needed.
 """
 
 import os
+import json
+import tempfile
 from pathlib import Path
 
 from google.auth.transport.requests import Request
@@ -18,8 +24,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Scopes define what the agent is allowed to do on behalf of the user.
-# Changing these requires deleting token.json and re-authenticating.
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.send",
@@ -29,80 +33,106 @@ SCOPES = [
 CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json")
 TOKEN_PATH = os.getenv("GOOGLE_TOKEN_PATH", "token.json")
 
+# Railway env var names
+CREDENTIALS_ENV = "GOOGLE_CREDENTIALS_JSON"
+TOKEN_ENV = "GOOGLE_TOKEN_JSON"
+
 
 def get_gmail_service():
-    """
-    Authenticate and return an authorized Gmail API service.
-
-    Flow:
-      1. If token.json exists and is valid → use it directly.
-      2. If token.json is expired → refresh it silently.
-      3. If no token exists → open browser for user login, then save token.
-
-    Returns:
-        googleapiclient.discovery.Resource: Authenticated Gmail service.
-    """
+    """Authenticate and return an authorized Gmail API service."""
     creds = _load_or_refresh_credentials()
-    service = build("gmail", "v1", credentials=creds)
-    return service
+    return build("gmail", "v1", credentials=creds)
 
 
 def get_calendar_service():
-    """
-    Authenticate and return an authorized Google Calendar API service.
-    Uses the same credentials/token as Gmail — single OAuth flow for both.
-
-    Returns:
-        googleapiclient.discovery.Resource: Authenticated Calendar service.
-    """
+    """Authenticate and return an authorized Google Calendar API service."""
     creds = _load_or_refresh_credentials()
-    service = build("calendar", "v3", credentials=creds)
-    return service
+    return build("calendar", "v3", credentials=creds)
 
 
 def _load_or_refresh_credentials() -> Credentials:
     """
-    Internal helper: load existing credentials or run the OAuth flow.
+    Load credentials from env vars (Railway) or files (local).
 
-    Returns:
-        google.oauth2.credentials.Credentials: Valid credentials object.
-
-    Raises:
-        FileNotFoundError: If credentials.json is missing.
+    Priority:
+      1. GOOGLE_CREDENTIALS_JSON env var → write to temp file → use
+      2. credentials.json file on disk → use directly
     """
-    if not Path(CREDENTIALS_PATH).exists():
-        raise FileNotFoundError(
-            f"credentials.json not found at '{CREDENTIALS_PATH}'.\n"
-            "Download it from Google Cloud Console → APIs & Services → Credentials."
-        )
+    # ── Resolve credentials source ─────────────────────────────
+    credentials_json_str = os.getenv(CREDENTIALS_ENV)
+    token_json_str = os.getenv(TOKEN_ENV)
 
+    if credentials_json_str:
+        # Railway mode — write env var contents to temp files
+        credentials_file = _write_temp_json(credentials_json_str, "credentials")
+        token_file = _write_temp_json(token_json_str, "token") if token_json_str else None
+    else:
+        # Local mode — use files from disk
+        if not Path(CREDENTIALS_PATH).exists():
+            raise FileNotFoundError(
+                f"credentials.json not found at '{CREDENTIALS_PATH}'.\n"
+                "For local dev: download from Google Cloud Console.\n"
+                "For Railway: set GOOGLE_CREDENTIALS_JSON env var."
+            )
+        credentials_file = CREDENTIALS_PATH
+        token_file = TOKEN_PATH if Path(TOKEN_PATH).exists() else None
+
+    # ── Load and refresh credentials ───────────────────────────
     creds = None
 
-    # Load saved token if it exists
-    if Path(TOKEN_PATH).exists():
-        creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
+    if token_file and Path(token_file).exists():
+        creds = Credentials.from_authorized_user_file(token_file, SCOPES)
 
-    # If no valid credentials, refresh or re-authenticate
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            # Silently refresh the access token using the stored refresh token
             creds.refresh(Request())
+            # Save refreshed token
+            _save_token(creds, token_json_str)
         else:
-            # First-time login: open browser for user consent
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
+            if credentials_json_str:
+                # Railway: can't open a browser — token must be pre-set
+                raise RuntimeError(
+                    "No valid token found on Railway.\n"
+                    "Run locally first to generate token.json, then set "
+                    "GOOGLE_TOKEN_JSON in Railway with its contents."
+                )
+            # Local: open browser for login
+            flow = InstalledAppFlow.from_client_secrets_file(
+                credentials_file, SCOPES
+            )
             creds = flow.run_local_server(port=0)
-
-        # Save credentials for next run
-        with open(TOKEN_PATH, "w") as token_file:
-            token_file.write(creds.to_json())
-        print(f"Token saved to {TOKEN_PATH}")
+            _save_token(creds, None)
+            print(f"Token saved to {TOKEN_PATH}")
 
     return creds
 
 
+def _write_temp_json(json_str: str, prefix: str) -> str:
+    """Write a JSON string to a temp file and return the path."""
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".json",
+        prefix=f"agent_{prefix}_",
+        delete=False,
+    )
+    tmp.write(json_str)
+    tmp.flush()
+    tmp.close()
+    return tmp.name
+
+
+def _save_token(creds: Credentials, existing_env_value: str):
+    """Save refreshed credentials to file (local) or log for Railway."""
+    if existing_env_value:
+        # On Railway — log the new token so the user can update the env var
+        print("Token refreshed. Update GOOGLE_TOKEN_JSON in Railway with:")
+        print(creds.to_json())
+    else:
+        with open(TOKEN_PATH, "w") as f:
+            f.write(creds.to_json())
+
+
 if __name__ == "__main__":
-    # Quick test: authenticate and print the authenticated user's email
     service = get_gmail_service()
     profile = service.users().getProfile(userId="me").execute()
     print(f"Authenticated as: {profile['emailAddress']}")
-    print(f"Total messages: {profile['messagesTotal']}")
