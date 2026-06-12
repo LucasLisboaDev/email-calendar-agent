@@ -82,3 +82,4 @@ email-calendar-agent/
 | `EMAIL_FETCH_LIMIT` | Emails to fetch per run | `10` |
 | `EMAIL_LABEL` | Gmail label to watch | `INBOX` |
 | `HUMAN_APPROVAL_REQUIRED` | Require approval before actions | `true` |
+# Phase 4 active
