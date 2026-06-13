@@ -17,16 +17,17 @@ This prevents HTTP timeouts on large inboxes.
 """
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv()
 
 from orchestrator import run_agent
 from agent.router import get_pending_approvals, approve_action, reject_action
+from auth.gmail_auth import get_calendar_service
 from api.models import (
     RunRequest,
     RunResponse,
@@ -36,6 +37,8 @@ from api.models import (
     ActionResponse,
     HealthResponse,
     ApproveRequest,
+    CalendarEvent,
+    CalendarEventsResponse,
 )
 from utils.logger import logger
 
@@ -212,6 +215,81 @@ async def reject(email_id: str):
         status="rejected",
         email_id=email_id,
         message="Action rejected. No further processing.",
+    )
+
+
+@app.get("/calendar/events", response_model=CalendarEventsResponse, tags=["Calendar"])
+async def get_calendar_events(
+    days_ahead: int = Query(default=7, ge=1, le=90, description="How many days ahead to fetch"),
+    max_results: int = Query(default=20, ge=1, le=100, description="Maximum number of events to return"),
+):
+    """
+    Fetch upcoming events from the primary Google Calendar.
+
+    - **days_ahead**: Window size in days from now (1–90, default 7)
+    - **max_results**: Cap on events returned (1–100, default 20)
+    """
+    try:
+        service = get_calendar_service()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Calendar auth failed: {e}")
+
+    now = datetime.now(timezone.utc)
+    time_min = now.isoformat()
+    time_max = (now + timedelta(days=days_ahead)).isoformat()
+
+    try:
+        result = (
+            service.events()
+            .list(
+                calendarId="primary",
+                timeMin=time_min,
+                timeMax=time_max,
+                maxResults=max_results,
+                singleEvents=True,
+                orderBy="startTime",
+            )
+            .execute()
+        )
+    except Exception as e:
+        logger.error(f"Google Calendar API error: {e}")
+        raise HTTPException(status_code=502, detail=f"Google Calendar API error: {e}")
+
+    raw_events = result.get("items", [])
+
+    events: list[CalendarEvent] = []
+    for ev in raw_events:
+        start_raw = ev.get("start", {})
+        end_raw = ev.get("end", {})
+        all_day = "date" in start_raw and "dateTime" not in start_raw
+
+        meet_link = ""
+        conf = ev.get("conferenceData", {})
+        for ep in conf.get("entryPoints", []):
+            if ep.get("entryPointType") == "video":
+                meet_link = ep.get("uri", "")
+                break
+
+        events.append(
+            CalendarEvent(
+                id=ev["id"],
+                title=ev.get("summary", "(no title)"),
+                start=start_raw.get("dateTime") or start_raw.get("date", ""),
+                end=end_raw.get("dateTime") or end_raw.get("date", ""),
+                all_day=all_day,
+                attendees=[a["email"] for a in ev.get("attendees", [])],
+                calendar_link=ev.get("htmlLink"),
+                meet_link=meet_link or None,
+                status=ev.get("status", "confirmed"),
+            )
+        )
+
+    logger.info(f"GET /calendar/events — {len(events)} events in next {days_ahead} days")
+    return CalendarEventsResponse(
+        count=len(events),
+        time_min=time_min,
+        time_max=time_max,
+        events=events,
     )
 
 

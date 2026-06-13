@@ -98,3 +98,24 @@ class HealthResponse(BaseModel):
     status: str
     version: str
     phase: str
+
+
+class CalendarEvent(BaseModel):
+    """A single Google Calendar event."""
+    id: str
+    title: str
+    start: str
+    end: str
+    all_day: bool
+    attendees: list[str]
+    calendar_link: Optional[str] = None
+    meet_link: Optional[str] = None
+    status: str
+
+
+class CalendarEventsResponse(BaseModel):
+    """Response body for GET /calendar/events."""
+    count: int
+    time_min: str
+    time_max: str
+    events: list[CalendarEvent]
